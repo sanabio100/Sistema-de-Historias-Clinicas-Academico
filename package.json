@@ -1,6 +1,3 @@
-### 1. `package.json` (Dependências e Scripts)
-Este arquivo define as dependências iniciais do ecossistema, incluindo ícones (`lucide-react`) e o framework de compilação rápida `vite`.
-```json
 {
   "name": "sistema-prontuario-academico",
   "private": true,
@@ -12,9 +9,11 @@ Este arquivo define as dependências iniciais do ecossistema, incluindo ícones 
     "preview": "vite preview"
   },
   "dependencies": {
+    "@notionhq/client": "^2.2.15",
     "lucide-react": "^0.354.0",
     "react": "^18.2.0",
-    "react-dom": "^18.2.0"
+    "react-dom": "^18.2.0",
+    "swr": "^2.2.5"
   },
   "devDependencies": {
     "@types/react": "^18.2.66",
