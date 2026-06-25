@@ -35,11 +35,28 @@ import { Client } from "@notionhq/client"
 
 let cachedClient = null
 
+/**
+ * Aceita tanto um ID puro quanto uma URL completa do Notion e devolve o ID
+ * de database/página normalizado no formato 8-4-4-4-12. Isso permite que o
+ * usuário cole a URL da database diretamente na variável de ambiente.
+ */
+function normalizeId(value) {
+  if (!value) return value
+  const cleaned = String(value).trim()
+  // remove query string e captura o último bloco de 32 caracteres hexadecimais
+  const match = cleaned.replace(/[?#].*$/, "").match(/([0-9a-fA-F]{32})(?!.*[0-9a-fA-F]{32})/)
+  const hex = match ? match[1] : cleaned.replace(/-/g, "")
+  if (/^[0-9a-fA-F]{32}$/.test(hex)) {
+    return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`
+  }
+  return cleaned
+}
+
 function getConfig() {
   return {
-    token: process.env.NOTION_TOKEN,
-    patientsDb: process.env.NOTION_PATIENTS_DB_ID,
-    historyDb: process.env.NOTION_HISTORY_DB_ID,
+    token: process.env.NOTION_TOKEN?.trim(),
+    patientsDb: normalizeId(process.env.NOTION_PATIENTS_DB_ID),
+    historyDb: normalizeId(process.env.NOTION_HISTORY_DB_ID),
   }
 }
 
@@ -59,8 +76,142 @@ function getClient() {
 }
 
 export function isConfigured() {
-  const { token, patientsDb, historyDb } = getConfig()
-  return Boolean(token && patientsDb && historyDb)
+  const { token, patientsDb } = getConfig()
+  // basta o token e ao menos uma referência (página ou database) para começar
+  return Boolean(token && patientsDb)
+}
+
+/* ---------------- Schemas das databases ---------------- */
+
+const PATIENTS_TITLE = "Pacientes"
+const HISTORY_TITLE = "Evoluções Clínicas"
+
+const PATIENTS_SCHEMA = {
+  Nome: { title: {} },
+  Idade: { number: {} },
+  Sexo: { select: { options: [{ name: "Feminino" }, { name: "Masculino" }, { name: "Outro" }] } },
+  Telefone: { phone_number: {} },
+  Prontuario: { rich_text: {} },
+  DataNascimento: { date: {} },
+  QueixaPrincipal: { rich_text: {} },
+}
+
+const HISTORY_SCHEMA = {
+  Resumo: { title: {} },
+  PacienteID: { rich_text: {} },
+  Data: { date: {} },
+  Tipo: {
+    select: {
+      options: [
+        { name: "Consulta" },
+        { name: "Evolução" },
+        { name: "Anamnese" },
+        { name: "Exame" },
+        { name: "Procedimento" },
+        { name: "Alta" },
+      ],
+    },
+  },
+  Subjetivo: { rich_text: {} },
+  Objetivo: { rich_text: {} },
+  Avaliacao: { rich_text: {} },
+  Plano: { rich_text: {} },
+}
+
+/* ---------------- Resolução / auto-provisionamento ---------------- */
+
+// cache em memória dos IDs de database já resolvidos
+const resolvedIds = { patients: null, history: null }
+let rootPageId = null
+
+async function isDatabase(notion, id) {
+  try {
+    await notion.databases.retrieve({ database_id: id })
+    return true
+  } catch {
+    return false
+  }
+}
+
+async function isAccessiblePage(notion, id) {
+  try {
+    await notion.pages.retrieve({ page_id: id })
+    return true
+  } catch {
+    return false
+  }
+}
+
+// procura uma child_database com determinado título dentro de uma página
+async function findChildDatabase(notion, pageId, title) {
+  let cursor
+  do {
+    const res = await notion.blocks.children.list({
+      block_id: pageId,
+      start_cursor: cursor,
+      page_size: 100,
+    })
+    for (const block of res.results) {
+      if (block.type === "child_database" && block.child_database?.title === title) {
+        return block.id
+      }
+    }
+    cursor = res.has_more ? res.next_cursor : undefined
+  } while (cursor)
+  return null
+}
+
+async function createDatabase(notion, pageId, title, schema) {
+  const db = await notion.databases.create({
+    parent: { type: "page_id", page_id: pageId },
+    title: [{ type: "text", text: { content: title } }],
+    properties: schema,
+  })
+  return db.id
+}
+
+// descobre uma página acessível para hospedar as databases criadas automaticamente
+async function getRootPage(notion) {
+  if (rootPageId) return rootPageId
+  const { patientsDb, historyDb } = getConfig()
+  for (const candidate of [patientsDb, historyDb]) {
+    if (candidate && (await isAccessiblePage(notion, candidate))) {
+      rootPageId = candidate
+      return rootPageId
+    }
+  }
+  const err = new Error(
+    "Nenhuma página acessível encontrada. Compartilhe a página do Notion com a integração e use a URL dessa página em NOTION_PATIENTS_DB_ID.",
+  )
+  err.code = "NO_ROOT_PAGE"
+  throw err
+}
+
+/**
+ * Resolve o ID real de uma database. Se a variável de ambiente já aponta para
+ * uma database, usa-a. Caso contrário, procura (ou cria) a database dentro de
+ * uma página acessível do Notion. Resultado é cacheado.
+ */
+async function resolveDb(kind) {
+  if (resolvedIds[kind]) return resolvedIds[kind]
+
+  const notion = getClient()
+  const { patientsDb, historyDb } = getConfig()
+  const configured = kind === "patients" ? patientsDb : historyDb
+  const title = kind === "patients" ? PATIENTS_TITLE : HISTORY_TITLE
+  const schema = kind === "patients" ? PATIENTS_SCHEMA : HISTORY_SCHEMA
+
+  // 1. já é uma database válida?
+  if (configured && (await isDatabase(notion, configured))) {
+    resolvedIds[kind] = configured
+    return configured
+  }
+
+  // 2. resolve dentro de uma página acessível (encontra ou cria)
+  const root = await getRootPage(notion)
+  const existing = await findChildDatabase(notion, root, title)
+  resolvedIds[kind] = existing || (await createDatabase(notion, root, title, schema))
+  return resolvedIds[kind]
 }
 
 /* ---------------- Helpers de leitura de propriedades ---------------- */
@@ -143,7 +294,7 @@ function mapEvolution(page) {
 
 export async function listPatients(search = "") {
   const notion = getClient()
-  const { patientsDb } = getConfig()
+  const patientsDb = await resolveDb("patients")
 
   const query = {
     database_id: patientsDb,
@@ -170,7 +321,7 @@ export async function getPatient(id) {
 
 export async function createPatient(data) {
   const notion = getClient()
-  const { patientsDb } = getConfig()
+  const patientsDb = await resolveDb("patients")
 
   const page = await notion.pages.create({
     parent: { database_id: patientsDb },
@@ -189,7 +340,7 @@ export async function createPatient(data) {
 
 export async function listEvolutions(patientId) {
   const notion = getClient()
-  const { historyDb } = getConfig()
+  const historyDb = await resolveDb("history")
 
   const res = await notion.databases.query({
     database_id: historyDb,
@@ -205,7 +356,7 @@ export async function listEvolutions(patientId) {
 
 export async function createEvolution(data) {
   const notion = getClient()
-  const { historyDb } = getConfig()
+  const historyDb = await resolveDb("history")
 
   const page = await notion.pages.create({
     parent: { database_id: historyDb },
